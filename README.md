@@ -2,13 +2,13 @@
 
 A menu bar fan controller for the HP OMEN 16-wd0990tx (board 8BA9) running Intel macOS Tahoe through OpenCore. The app shows CPU and GPU temperatures, both fans’ measured RPM, and an animated fan that follows fan activity and respects Reduce Motion.
 
-- **Automatic** gives HP firmware control of both fans.
+- **Automatic** returns control to HP firmware. After a manual override, the bridge requests full fan speed and lets the firmware override timer expire. Allow up to two minutes for the normal firmware curve to resume.
 - **Fixed speed** applies one setting to both fans. Each fan uses its own firmware maximum, so their RPM can differ.
 - **Fan curve** interpolates between four editable temperature points using the hotter of the CPU and GPU sensors. The chart plots each fan’s target RPM. **Apply curve** runs and saves the configuration. The app starts in Automatic every time it launches.
 
 ## Compatibility and validation
 
-The app and bridge target an x86-64 HP OMEN 16-wd0990tx with board 8BA9, BIOS F.26, and macOS 26.7.3 (Darwin 25.6.0). The bridge checks the HP board and WMI interface at runtime. GPU temperature requires the NVIDIA driver to publish `Temperature(C)` in the `NVAccel` IORegistry service. Live GPU temperature and fan RPM, the previous bridge’s fan override, and the curve interpolation have been verified on the development setup. Bridge 1.0.2’s Intel CPU temperature and firmware RPM queries still need post-reboot hardware validation. This is an early release.
+The app and bridge target an x86-64 HP OMEN 16-wd0990tx with board 8BA9, BIOS F.26, and macOS 26.7.3 (Darwin 25.6.0). The bridge checks the HP board and WMI interface at runtime. GPU temperature requires the NVIDIA driver to publish `Temperature(C)` in the `NVAccel` IORegistry service. Live GPU temperature and fan RPM, the previous bridge’s fan override, and the curve interpolation have been verified on the development setup. Bridge 1.0.3’s Intel CPU temperature, firmware RPM queries, and corrected handoff still need post-reboot hardware validation. This is an early release.
 
 The kernel bridge is an unsigned OpenCore-injected extension. Install it only on a compatible Hackintosh with a working OpenCore recovery path. Compiled packages are distributed as ZIP files.
 
@@ -34,7 +34,7 @@ The kernel bridge is an unsigned OpenCore-injected extension. Install it only on
 
 ## Temperature and cooling behavior
 
-Manual controls are bounded to 70–100% of each fan’s firmware maximum. The app asks for full speed at 90 °C CPU or 83 °C GPU during an override. The bridge uses a 45-second lease, and the app renews it while an override is active. Firmware regains control when the lease expires, on app exit or sleep, or when macOS reports serious thermal pressure. Curve mode also hands control back when either temperature becomes unavailable. With an older bridge, the app labels RPM targets as estimates and may show no CPU reading.
+Manual controls are bounded to 70–100% of each fan’s firmware maximum. The app asks for full speed at 90 °C CPU or 83 °C GPU during an override. The bridge uses a 45-second lease, and the app renews it while an override is active. The handoff starts when the lease expires, on app exit or sleep, or when macOS reports serious thermal pressure. Curve mode also starts a handoff when either temperature becomes unavailable. App 1.1.1 requires bridge 1.0.3 for manual control. Previous bridge versions could command both fans to stop when switching to Automatic on this board. With an older bridge, the app labels RPM targets as estimates and may show no CPU reading.
 
 ## Troubleshooting and rollback
 
@@ -46,7 +46,7 @@ kmutil showloaded --list-only | grep local.omen.fans.bridge
 ```
 
 - **Bridge offline:** Confirm which EFI booted macOS, check that its `Kernel → Add` entry points to the installed bundle, validate the config, then reboot from that EFI.
-- **Missing CPU temperature or estimated graph targets:** Confirm bridge **1.0.2** is loaded after a restart. The Intel package sensor must be supported and report a valid value. The app also checks VirtualSMC’s `TC0D` key when it is available.
+- **Missing CPU temperature or estimated graph targets:** Confirm bridge **1.0.3** is loaded after a restart. The Intel package sensor must be supported and report a valid value. The app also checks VirtualSMC’s `TC0D` key when it is available.
 - **Missing GPU temperature:** Confirm your NVIDIA driver exposes `Temperature(C)` under the `NVAccel` service. Curve mode requires a valid reading from both sensors.
 - **Rollback:** Quit the app and replace the bridge with the backed-up bundle, or disable the `OmenFanBridge.kext` entry and remove that bundle from `EFI/OC/Kexts`. Restart through the same EFI. If macOS fails to start, restore the known-good EFI configuration from another boot environment.
 

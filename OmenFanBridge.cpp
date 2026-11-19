@@ -13,6 +13,7 @@
 
 namespace {
 constexpr uint32_t leaseMS = 45000;
+constexpr uint32_t firmwareHandoffMS = 120000;
 constexpr uint8_t minimumPercent = 70;
 constexpr uint8_t fanCount = 0x10;
 constexpr uint8_t readRPM = 0x2D;
@@ -59,9 +60,8 @@ class OmenFanBridge final : public IOService {
     IOTimerEventSource *timer = nullptr;
     bool timerAttached = false;
     bool overrideActive = false;
-    bool resetPending = false;
     uint64_t deadline = 0;
-    uint8_t resetAttempts = 0;
+    uint64_t handoffUntil = 0;
     char method[5] = {'W', 'M', '\0', '\0', '\0'};
     uint8_t lower[2] = {};
     uint8_t upper[2] = {};
@@ -249,19 +249,15 @@ IOReturn OmenFanBridge::arm(uint32_t milliseconds) {
 }
 
 IOReturn OmenFanBridge::restore() {
-    if (!overrideActive && !resetPending) return kIOReturnSuccess;
+    if (!overrideActive) return kIOReturnSuccess;
     timer->cancelTimeout();
     deadline = 0;
     overrideActive = false;
-    resetPending = true;
-    const uint8_t automatic[2] = {};
-    auto result = query(setRPM, automatic, sizeof(automatic));
-    if (result == kIOReturnSuccess) {
-        resetPending = false;
-        resetAttempts = 0;
-        return kIOReturnSuccess;
-    }
-    if (++resetAttempts < 3 && timerAttached) arm(5000);
+
+    // On 8BA9 zero is a speed command. Leave the fans cooling at full speed
+    // and stop sending the 0x10 keep-alive so firmware can resume its curve.
+    const auto result = query(setRPM, upper, sizeof(upper));
+    clock_interval_to_deadline(firmwareHandoffMS, NSEC_PER_MSEC, &handoffUntil);
     return result;
 }
 
@@ -288,14 +284,13 @@ IOReturn OmenFanBridge::command(uint32_t selector, IOExternalMethodArguments *ar
         if (result == kIOReturnSuccess) {
             args->scalarOutput[0] = speed[0] * 100;
             args->scalarOutput[1] = speed[1] * 100;
-            args->scalarOutput[2] = overrideActive ? 1 : resetPending ? 2 : 0;
+            args->scalarOutput[2] = overrideActive ? 1 : mach_absolute_time() < handoffUntil ? 2 : 0;
             args->scalarOutput[3] = readCapabilities() == kIOReturnSuccess;
         }
     } else if (selector == 1) {
         result = restore();
     } else if (selector == 2) {
         result = readCapabilities();
-        if (result == kIOReturnSuccess && resetPending) result = restore();
         if (result == kIOReturnSuccess) result = refreshFirmware();
         if (result == kIOReturnSuccess) {
             uint8_t target[2];
@@ -303,13 +298,9 @@ IOReturn OmenFanBridge::command(uint32_t selector, IOExternalMethodArguments *ar
                 const auto speed = (args->scalarInput[i] * upper[i] + 50) / 100;
                 target[i] = static_cast<uint8_t>(speed < lower[i] ? lower[i] : speed);
             }
-            resetPending = true;
+            overrideActive = true;
             result = query(setRPM, target, sizeof(target));
             if (result == kIOReturnSuccess) result = arm(leaseMS);
-            if (result == kIOReturnSuccess) {
-                overrideActive = true;
-                resetPending = false;
-            }
         }
         if (result != kIOReturnSuccess) restore();
     } else if (selector == 4) {
@@ -320,6 +311,8 @@ IOReturn OmenFanBridge::command(uint32_t selector, IOExternalMethodArguments *ar
         }
     } else if (selector == 5) {
         result = readCPUTemperature(args->scalarOutput);
+    } else if (selector == 6) {
+        args->scalarOutput[0] = 1;
     } else {
         result = overrideActive ? refreshFirmware() : kIOReturnNotReady;
         if (result == kIOReturnSuccess) result = arm(leaseMS);
@@ -359,9 +352,9 @@ IOReturn OmenFanClient::clientClose() {
 IOReturn OmenFanClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
                                       IOExternalMethodDispatch *, OSObject *, void *) {
     if (!ownsBridge || isInactive()) return kIOReturnNotOpen;
-    if (selector > 5) return kIOReturnUnsupported;
+    if (selector > 6) return kIOReturnUnsupported;
     if (args->scalarInputCount != (selector == 2 ? 2u : 0u) ||
-        args->scalarOutputCount != (selector == 0 ? 4u : selector == 4 ? 2u : selector == 5 ? 1u : 0u) ||
+        args->scalarOutputCount != (selector == 0 ? 4u : selector == 4 ? 2u : (selector == 5 || selector == 6) ? 1u : 0u) ||
         args->structureInputSize || args->structureOutputSize ||
         args->structureInputDescriptor || args->structureOutputDescriptor || args->asyncWakePort)
         return kIOReturnBadArgument;
@@ -377,7 +370,7 @@ IOReturn OmenFanClient::externalMethod(uint32_t selector, IOExternalMethodArgume
 extern "C" {
 extern kern_return_t _start(kmod_info_t *, void *);
 extern kern_return_t _stop(kmod_info_t *, void *);
-KMOD_EXPLICIT_DECL(local_omen_fans_bridge, "1.0.2", _start, _stop)
+KMOD_EXPLICIT_DECL(local_omen_fans_bridge, "1.0.3", _start, _stop)
 __attribute__((visibility("default"))) kmod_start_func_t *_realmain = nullptr;
 __attribute__((visibility("default"))) kmod_stop_func_t *_antimain = nullptr;
 __attribute__((visibility("default"))) int _kext_apple_cc = __APPLE_CC__;

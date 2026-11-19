@@ -30,6 +30,7 @@ private final class Bridge {
     func automatic() throws { _ = try call(1) }
     func apply(cpu: Int, gpu: Int) throws { _ = try call(2, inputs: [UInt64(cpu), UInt64(gpu)]) }
     func limits() throws -> [Int] { try call(4, outputCount: 2).map(Int.init) }
+    func supportsSafeHandoff() -> Bool { (try? call(6, outputCount: 1).first) == 1 }
     func cpuTemperature() throws -> Double { Double(try call(5, outputCount: 1)[0]) }
     func renew() throws { _ = try call(3) }
 
@@ -120,6 +121,8 @@ private final class FanModel: ObservableObject {
     @Published private(set) var message: String?
     @Published private(set) var target: Int?
     @Published private(set) var thermalSafe = true
+    @Published private(set) var safeHandoff = false
+    @Published private(set) var handingOff = false
     @Published var visible = false
 
     private let bridge = Bridge()
@@ -147,7 +150,7 @@ private final class FanModel: ObservableObject {
     }
 
     var canApply: Bool { canControl && (tab != .curve || hottest != nil) }
-    private var canControl: Bool { reading?.canControl == true && reading?.mode != 2 && thermalSafe }
+    private var canControl: Bool { safeHandoff && reading?.canControl == true && thermalSafe }
     var graphLimits: [Int] { limits ?? [5500, 5800] }
 
     func update() {
@@ -163,13 +166,18 @@ private final class FanModel: ObservableObject {
             if wasOffline { message = nil }
             if reading?.canControl == true && !attemptedLimits {
                 attemptedLimits = true
+                safeHandoff = bridge.supportsSafeHandoff()
                 if let values = try? bridge.limits(), values.count == 2, values.allSatisfy({ (2000...10000).contains($0) }) {
                     limits = values
                 }
             }
             if cpu == nil && limits != nil { cpu = try? bridge.cpuTemperature() }
-            if reading?.mode == 2 {
-                message = "Waiting for firmware to restore automatic cooling."
+            let wasHandingOff = handingOff
+            handingOff = reading?.mode == 2
+            if handingOff {
+                message = "Returning control to firmware. Allow up to two minutes."
+            } else if wasHandingOff {
+                message = nil
             } else if reading?.canControl != true {
                 message = "Fan speed limits are unavailable."
             }
@@ -198,6 +206,7 @@ private final class FanModel: ObservableObject {
         runningCurve = points
         do {
             try drive(force: true)
+            handingOff = false
             if tab == .curve, let data = try? JSONEncoder().encode(points) {
                 UserDefaults.standard.set(data, forKey: curveKey)
             }
@@ -222,7 +231,11 @@ private final class FanModel: ObservableObject {
         active = .automatic
         target = nil
         message = reason
-        do { try bridge.automatic() } catch { fail(error) }
+        guard safeHandoff else { return }
+        do {
+            try bridge.automatic()
+            update()
+        } catch { fail(error) }
     }
 
     func sleep() {
@@ -241,6 +254,7 @@ private final class FanModel: ObservableObject {
         active = .automatic
         target = nil
         reading = nil
+        handingOff = false
         message = error.localizedDescription
         bridge.close()
     }
@@ -303,7 +317,11 @@ private struct FanPanel: View {
                     .font(.callout).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 45, alignment: .leading)
             }
-            if let message = model.message {
+            if !model.safeHandoff, model.reading?.canControl == true {
+                Label("Restart through OpenCore with bridge 1.0.3 to enable fan control.", systemImage: "info.circle")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let message = model.message {
                 Label(message, systemImage: "info.circle").font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else if model.tab != .automatic, (model.tab == .curve && model.hottest == nil) || !model.thermalSafe {
@@ -343,8 +361,8 @@ private struct FanPanel: View {
             }
             Spacer()
             HStack(spacing: 5) {
-                Circle().fill(model.active == .automatic ? Color.green : accent).frame(width: 6, height: 6)
-                Text(model.active.rawValue).font(.caption.weight(.semibold))
+                Circle().fill(model.handingOff ? Color.orange : model.active == .automatic ? Color.green : accent).frame(width: 6, height: 6)
+                Text(model.handingOff ? "Firmware handoff" : model.active.rawValue).font(.caption.weight(.semibold))
             }
             .padding(.horizontal, 9).padding(.vertical, 6)
             .background(.quaternary.opacity(0.65), in: Capsule())
@@ -535,7 +553,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
     }
 
-    @objc private func tick() { if model.visible || model.active != .automatic { model.update() } }
+    @objc private func tick() { if model.visible || model.handingOff || model.active != .automatic { model.update() } }
     @objc private func thermalChanged() { DispatchQueue.main.async { [weak self] in self?.tick() } }
     @objc private func willSleep() { model.sleep() }
     @objc private func didWake() { model.wake() }
